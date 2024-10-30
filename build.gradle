@@ -72,7 +72,9 @@ dependencies {
     testImplementation "org.testng:testng:7.5+"
     implementation "org.slf4j:slf4j-simple:latest.release"
     implementation "org.slf4j:slf4j-api:latest.release"
-    
+
+    runtimeOnly 'software.amazon.nio.s3:aws-java-nio-spi-for-s3:latest.release'
+
     // JAX-B dependencies for JDK 9+
     implementation "org.glassfish.jaxb:jaxb-runtime:2.3.2"
     implementation "javax.xml.bind:jaxb-api:2.3.1"

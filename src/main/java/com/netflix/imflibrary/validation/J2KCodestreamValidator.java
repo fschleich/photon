@@ -23,9 +23,6 @@ import java.util.List;
  */
 public final class J2KCodestreamValidator {
 
-    /** Bytes read from each sampled essence element; the main header (SOC..first SOT) is well within this. */
-    private static final int MAX_HEADER_BYTES = 8192;
-
     private J2KCodestreamValidator() {}
 
     /**
@@ -80,15 +77,16 @@ public final class J2KCodestreamValidator {
     private static void validateFrame(IMFTrackFileReader trackFileReader, int frameIndex, UL pictureEssenceCoding,
                                       J2KHeaderParameters descriptorParams, IMFErrorLogger logger) {
         String prefix = String.format("J2K-CS [frame %d]: ", frameIndex);
-        byte[] header;
+        byte[] codestreamBytes;
         try {
-            header = trackFileReader.getEssenceElementHeaderBytes(frameIndex, MAX_HEADER_BYTES, logger);
+            // The whole codestream is read so the tile-part structure can be walked for TLM conformance.
+            codestreamBytes = trackFileReader.getEssenceElementBytes(frameIndex, logger);
         } catch (IOException e) {
             logger.addError(IMFErrorLogger.IMFErrors.ErrorCodes.IMF_ESSENCE_COMPONENT_ERROR,
                     IMFErrorLogger.IMFErrors.ErrorLevels.NON_FATAL, prefix + "could not read essence: " + e.getMessage());
             return;
         }
-        if (header == null) {
+        if (codestreamBytes == null) {
             logger.addError(IMFErrorLogger.IMFErrors.ErrorCodes.IMF_ESSENCE_COMPONENT_ERROR,
                     IMFErrorLogger.IMFErrors.ErrorLevels.NON_FATAL, prefix + "could not locate essence element");
             return;
@@ -96,7 +94,7 @@ public final class J2KCodestreamValidator {
 
         JPEG2000Codestream codestream;
         try {
-            codestream = JPEG2000Codestream.fromBytes(header);
+            codestream = JPEG2000Codestream.fromBytes(codestreamBytes);
         } catch (Exception e) {
             logger.addError(IMFErrorLogger.IMFErrors.ErrorCodes.IMF_ESSENCE_COMPONENT_ERROR,
                     IMFErrorLogger.IMFErrors.ErrorLevels.NON_FATAL, prefix + "could not parse codestream: " + e.getMessage());
@@ -107,6 +105,7 @@ public final class J2KCodestreamValidator {
         validateMarkers(codestream.getMarkers(), logger, prefix);
         validateProfileConformance(p, pictureEssenceCoding, logger, prefix);
         validateConsistency(p, descriptorParams, logger, prefix);
+        validateTLM(codestream, logger, prefix);
     }
 
     private static boolean isSupportedJ2KProfile(UL ul) {
@@ -170,6 +169,51 @@ public final class J2KCodestreamValidator {
         }
         if (markers.contains(JPEG2000Codestream.MARKER_RGN)) {
             error(logger, prefix, "RGN marker (region of interest) is disallowed");
+        }
+    }
+
+    /**
+     * Validates the TLM marker: required presence, structural consistency of the tile-part chain, and that the declared
+     * tile-part lengths match the actual tile-part lengths measured by walking the codestream.
+     */
+    private static void validateTLM(JPEG2000Codestream codestream, IMFErrorLogger logger, String prefix) {
+        boolean hasTLM = codestream.getMarkers().contains(JPEG2000Codestream.MARKER_TLM);
+        if (!hasTLM) {
+            error(logger, prefix, "missing required TLM marker");
+        }
+
+        List<JPEG2000Codestream.TilePart> tileParts = codestream.getTileParts();
+        if (tileParts.isEmpty()) {
+            // No tile-part structure available to cross-check (e.g. only the main header was read).
+            return;
+        }
+        if (!codestream.isTilePartStructureValid()) {
+            error(logger, prefix, "tile-part structure is inconsistent (a Psot length does not point to a valid tile-part boundary)");
+        }
+        if (!codestream.reachedEndOfCodestream()) {
+            error(logger, prefix, "codestream does not terminate with an EOC marker after the last tile-part");
+        }
+        if (!hasTLM) {
+            return;
+        }
+
+        List<JPEG2000Codestream.TLMEntry> tlm = codestream.getTLMEntries();
+        if (tlm.size() != tileParts.size()) {
+            error(logger, prefix, String.format("TLM declares %d tile-part length(s) but %d tile-part(s) are present",
+                    tlm.size(), tileParts.size()));
+            return;
+        }
+        for (int i = 0; i < tileParts.size(); i++) {
+            JPEG2000Codestream.TilePart tp = tileParts.get(i);
+            JPEG2000Codestream.TLMEntry entry = tlm.get(i);
+            if (entry.length != tp.length) {
+                error(logger, prefix, String.format("TLM tile-part %d length mismatch: TLM declares %d, actual %d",
+                        i, entry.length, tp.length));
+            }
+            if (entry.tileIndex != null && entry.tileIndex != tp.tileIndex) {
+                error(logger, prefix, String.format("TLM tile-part %d tile index mismatch: TLM declares %d, actual %d",
+                        i, entry.tileIndex, tp.tileIndex));
+            }
         }
     }
 

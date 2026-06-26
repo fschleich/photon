@@ -6,16 +6,18 @@ import com.netflix.imflibrary.utils.ByteProvider;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Collections;
 import java.util.List;
 
 /**
- * Parses the main header of a JPEG 2000 codestream (ISO/IEC 15444-1 / Rec. ITU-T T.800, Annex A) into the
- * {@link J2KHeaderParameters} model that Photon already derives from the MXF/CPL JPEG 2000 sub-descriptor.
+ * Parses a JPEG 2000 codestream (ISO/IEC 15444-1 / Rec. ITU-T T.800, Annex A) into the {@link J2KHeaderParameters}
+ * model that Photon already derives from the MXF/CPL JPEG 2000 sub-descriptor.
  *
- * <p>Only the main header is parsed: parsing begins at the SOC marker and stops at the first SOT (start of tile-part)
- * or EOC marker. This is sufficient to recover the SIZ, CAP, COD and QCD marker segments that the App2E
- * (SMPTE ST 2067-21) profile constraints are expressed against. The ordered list of markers encountered in the main
- * header is retained for marker presence / ordering checks.</p>
+ * <p>The main header is always parsed (SOC, SIZ, CAP, COD, QCD, TLM, ...). If the supplied buffer contains the whole
+ * codestream (not just the main header), the tile-part structure is additionally walked so that the declared TLM
+ * tile-part lengths can be verified against the actual tile-part lengths. When only the main-header prefix is supplied,
+ * {@link #getTileParts()} is empty.</p>
  */
 public final class JPEG2000Codestream {
 
@@ -38,18 +40,60 @@ public final class JPEG2000Codestream {
     public static final int MARKER_SOT = 0xFF90; // Start of tile-part (ends main header)
     public static final int MARKER_EOC = 0xFFD9; // End of codestream
 
+    /** A tile-part length declared in a TLM marker segment (ISO/IEC 15444-1 A.7.1). */
+    public static final class TLMEntry {
+        public final Integer tileIndex; // null when Ttlm is not present (tile-parts are in order)
+        public final long length;       // Ptlm: length in bytes from the SOT marker to the end of the tile-part data
+        public final int ztlm;          // index of the originating TLM segment (used for ordering)
+
+        public TLMEntry(Integer tileIndex, long length, int ztlm) {
+            this.tileIndex = tileIndex;
+            this.length = length;
+            this.ztlm = ztlm;
+        }
+    }
+
+    /** A tile-part discovered while walking the codestream (ISO/IEC 15444-1 A.4.2). */
+    public static final class TilePart {
+        public final int tileIndex;   // Isot
+        public final long psot;       // Psot as declared in the SOT marker (0 = extends to EOC)
+        public final int tpsot;       // tile-part index within the tile
+        public final int tnsot;       // number of tile-parts of the tile (0 = not yet defined)
+        public final long offset;     // byte offset of the SOT marker within the codestream
+        public final long length;     // actual tile-part length (measured by navigating the structure)
+
+        public TilePart(int tileIndex, long psot, int tpsot, int tnsot, long offset, long length) {
+            this.tileIndex = tileIndex;
+            this.psot = psot;
+            this.tpsot = tpsot;
+            this.tnsot = tnsot;
+            this.offset = offset;
+            this.length = length;
+        }
+    }
+
     private final J2KHeaderParameters headerParameters;
     private final List<Integer> markers;
+    private final List<TLMEntry> tlmEntries;
+    private final List<TilePart> tileParts;
+    private final boolean tilePartStructureValid;
+    private final boolean reachedEndOfCodestream;
 
-    private JPEG2000Codestream(J2KHeaderParameters headerParameters, List<Integer> markers) {
+    private JPEG2000Codestream(J2KHeaderParameters headerParameters, List<Integer> markers, List<TLMEntry> tlmEntries,
+                               List<TilePart> tileParts, boolean tilePartStructureValid, boolean reachedEndOfCodestream) {
         this.headerParameters = headerParameters;
         this.markers = markers;
+        this.tlmEntries = tlmEntries;
+        this.tileParts = tileParts;
+        this.tilePartStructureValid = tilePartStructureValid;
+        this.reachedEndOfCodestream = reachedEndOfCodestream;
     }
 
     /**
-     * Parses the main header of the supplied JPEG 2000 codestream.
+     * Parses the supplied JPEG 2000 codestream.
      *
-     * @param codestream the raw JPEG 2000 codestream bytes (at least the main header; trailing bytes are ignored)
+     * @param codestream the raw JPEG 2000 codestream bytes (at least the main header; the whole codestream is required
+     *                   for tile-part / TLM conformance)
      * @return a parsed {@link JPEG2000Codestream}
      * @throws IOException if the buffer is exhausted before the main header is fully parsed
      * @throws MXFException if the codestream does not start with an SOC marker
@@ -57,25 +101,34 @@ public final class JPEG2000Codestream {
     public static JPEG2000Codestream fromBytes(byte[] codestream) throws IOException {
         ByteProvider bp = new ByteArrayDataProvider(codestream);
         List<Integer> markers = new ArrayList<>();
+        List<TLMEntry> tlmEntries = new ArrayList<>();
 
+        int pos = 0;
         int soc = readU16(bp);
+        pos += 2;
         markers.add(soc);
         if (soc != MARKER_SOC) {
             throw new MXFException(String.format("JPEG 2000 codestream does not start with SOC marker (found 0x%04X)", soc));
         }
 
         J2KHeaderParameters p = new J2KHeaderParameters();
+        int firstSotOffset = -1;
 
         while (true) {
+            int markerPos = pos;
             int marker;
             try {
                 marker = readU16(bp);
+                pos += 2;
             } catch (IOException e) {
                 break; // main header consumed without encountering SOT/EOC
             }
 
             if (marker == MARKER_SOT || marker == MARKER_EOC) {
                 markers.add(marker);
+                if (marker == MARKER_SOT) {
+                    firstSotOffset = markerPos;
+                }
                 break;
             }
 
@@ -83,7 +136,9 @@ public final class JPEG2000Codestream {
 
             // All remaining main-header markers carry a 2-byte segment length (including the length field itself).
             int segmentLength = readU16(bp);
+            pos += 2;
             byte[] body = bp.getBytes(segmentLength - 2);
+            pos += (segmentLength - 2);
             ByteProvider seg = new ByteArrayDataProvider(body);
 
             switch (marker) {
@@ -99,13 +154,29 @@ public final class JPEG2000Codestream {
                 case MARKER_QCD:
                     parseQCD(seg, p, body.length);
                     break;
+                case MARKER_TLM:
+                    parseTLM(body, tlmEntries);
+                    break;
                 default:
                     // not needed for profile validation; segment body already consumed
                     break;
             }
         }
 
-        return new JPEG2000Codestream(p, markers);
+        // Order TLM entries across (possibly multiple) TLM segments by their Ztlm index.
+        tlmEntries.sort(Comparator.comparingInt(e -> e.ztlm));
+
+        List<TilePart> tileParts = new ArrayList<>();
+        boolean structureValid = true;
+        boolean reachedEOC = false;
+        if (firstSotOffset >= 0 && firstSotOffset + 12 <= codestream.length) {
+            WalkResult result = walkTileParts(codestream, firstSotOffset);
+            tileParts = result.tileParts;
+            structureValid = result.structureValid;
+            reachedEOC = result.reachedEndOfCodestream;
+        }
+
+        return new JPEG2000Codestream(p, markers, tlmEntries, tileParts, structureValid, reachedEOC);
     }
 
     /** @return the J2K header parameters recovered from the main header. */
@@ -116,6 +187,101 @@ public final class JPEG2000Codestream {
     /** @return the marker codes encountered in the main header, in order, starting with SOC. */
     public List<Integer> getMarkers() {
         return this.markers;
+    }
+
+    /** @return the tile-part lengths declared in the TLM marker segment(s), ordered by Ztlm. */
+    public List<TLMEntry> getTLMEntries() {
+        return Collections.unmodifiableList(this.tlmEntries);
+    }
+
+    /** @return the tile-parts discovered by walking the codestream (empty if only the main header was supplied). */
+    public List<TilePart> getTileParts() {
+        return Collections.unmodifiableList(this.tileParts);
+    }
+
+    /** @return true if the tile-part structure was navigated without inconsistency (each Psot landed on a boundary). */
+    public boolean isTilePartStructureValid() {
+        return this.tilePartStructureValid;
+    }
+
+    /** @return true if the tile-part walk reached the End of Codestream (EOC) marker. */
+    public boolean reachedEndOfCodestream() {
+        return this.reachedEndOfCodestream;
+    }
+
+    private static final class WalkResult {
+        final List<TilePart> tileParts;
+        final boolean structureValid;
+        final boolean reachedEndOfCodestream;
+
+        WalkResult(List<TilePart> tileParts, boolean structureValid, boolean reachedEndOfCodestream) {
+            this.tileParts = tileParts;
+            this.structureValid = structureValid;
+            this.reachedEndOfCodestream = reachedEndOfCodestream;
+        }
+    }
+
+    /*
+     * Walks the tile-parts of a complete codestream by navigating from each SOT marker by its Psot length. Each jump is
+     * verified to land on another SOT, on the EOC, or exactly at the end of the buffer; a jump that lands elsewhere
+     * indicates an inconsistent Psot and marks the structure invalid. The measured length of each tile-part is recorded
+     * for comparison against the TLM marker segment.
+     */
+    private static WalkResult walkTileParts(byte[] data, int start) {
+        List<TilePart> parts = new ArrayList<>();
+        boolean structureValid = true;
+        boolean reachedEOC = false;
+        int len = data.length;
+        int pos = start;
+        int guard = 0;
+
+        while (pos + 12 <= len && guard++ < 1_000_000) {
+            int marker = u16(data, pos);
+            if (marker == MARKER_EOC) {
+                reachedEOC = true;
+                break;
+            }
+            if (marker != MARKER_SOT) {
+                structureValid = false;
+                break;
+            }
+
+            int isot = u16(data, pos + 4);
+            long psot = u32(data, pos + 6);
+            int tpsot = data[pos + 10] & 0xFF;
+            int tnsot = data[pos + 11] & 0xFF;
+
+            if (psot == 0) {
+                // Last tile-part: extends to the EOC (or, failing that, the end of the buffer).
+                int end = (len >= 2 && u16(data, len - 2) == MARKER_EOC) ? (len - 2) : len;
+                reachedEOC = (end == len - 2);
+                parts.add(new TilePart(isot, psot, tpsot, tnsot, pos, (long) (end - pos)));
+                break;
+            }
+
+            parts.add(new TilePart(isot, psot, tpsot, tnsot, pos, psot));
+
+            long nextPos = pos + psot;
+            if (nextPos == len) {
+                break; // codestream ends exactly at the tile-part boundary (no trailing EOC)
+            }
+            if (nextPos + 2 > len) {
+                structureValid = false;
+                break;
+            }
+            int nextMarker = u16(data, (int) nextPos);
+            if (nextMarker == MARKER_EOC) {
+                reachedEOC = true;
+                break;
+            }
+            if (nextMarker != MARKER_SOT) {
+                structureValid = false;
+                break;
+            }
+            pos = (int) nextPos;
+        }
+
+        return new WalkResult(parts, structureValid, reachedEOC);
     }
 
     /* ISO/IEC 15444-1 A.5.1 Image and tile size (SIZ) */
@@ -199,6 +365,36 @@ public final class JPEG2000Codestream {
         p.qcd = qcd;
     }
 
+    /* ISO/IEC 15444-1 A.7.1 Tile-part lengths, main header (TLM) */
+    private static void parseTLM(byte[] body, List<TLMEntry> out) {
+        if (body.length < 2) {
+            return;
+        }
+        int ztlm = body[0] & 0xFF;
+        int stlm = body[1] & 0xFF;
+        int ttlmBytes = (stlm >> 4) & 0x3; // ST: 0, 1 or 2 bytes for the tile index Ttlm
+        int ptlmBytes = ((stlm >> 6) & 0x1) == 1 ? 4 : 2; // SP: 2 or 4 bytes for the tile-part length Ptlm
+        int entrySize = ttlmBytes + ptlmBytes;
+        if (entrySize == 0) {
+            return;
+        }
+        int count = (body.length - 2) / entrySize;
+        int p = 2;
+        for (int i = 0; i < count; i++) {
+            Integer tileIndex = null;
+            if (ttlmBytes == 1) {
+                tileIndex = body[p] & 0xFF;
+                p += 1;
+            } else if (ttlmBytes == 2) {
+                tileIndex = u16(body, p);
+                p += 2;
+            }
+            long length = (ptlmBytes == 2) ? u16(body, p) : u32(body, p);
+            p += ptlmBytes;
+            out.add(new TLMEntry(tileIndex, length, ztlm));
+        }
+    }
+
     private static int readU8(ByteProvider bp) throws IOException {
         return bp.getBytes(1)[0] & 0xFF;
     }
@@ -211,5 +407,13 @@ public final class JPEG2000Codestream {
     private static long readU32(ByteProvider bp) throws IOException {
         byte[] b = bp.getBytes(4);
         return ((long) (b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16) | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
+    }
+
+    private static int u16(byte[] b, int off) {
+        return ((b[off] & 0xFF) << 8) | (b[off + 1] & 0xFF);
+    }
+
+    private static long u32(byte[] b, int off) {
+        return ((long) (b[off] & 0xFF) << 24) | ((b[off + 1] & 0xFF) << 16) | ((b[off + 2] & 0xFF) << 8) | (b[off + 3] & 0xFF);
     }
 }

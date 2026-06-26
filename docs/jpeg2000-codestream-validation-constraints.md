@@ -212,11 +212,16 @@ The new codestream validator can call this same routine with codestream-derived
   size/style, transformation, precinct, progression order, CAP/HT parameters,
   marker presence (SOC/SIZ/COD/QCD) and disallowed markers (RGN/POC/PPM in main
   header; COD/COC/QCD/QCC main-header-only).
-- **Needs full codestream scan (beyond main header):** PPT/EPH/SOP presence in
-  tile-part headers, tile-part counts, TLM presence — require walking tile-part
-  headers. Decide whether to parse to first SOT only (cheap) or scan tile-parts
-  (more complete). *Recommendation: phase 1 = main header only; flag tile-part
-  checks as a later enhancement.*
+- **TLM presence + conformance (implemented):** TLM is a *main-header* marker, so
+  its presence is checkable from the main header. Conformance (declared tile-part
+  lengths matching actual lengths) is verified by walking the tile-part chain:
+  the validator reads the whole codestream, navigates SOT→SOT by `Psot` (verifying
+  each jump lands on an SOT/EOC), measures each tile-part length, and compares to
+  the TLM `Ptlm` entries (count, per-entry length, and tile index when present).
+- **Needs full codestream scan (not yet implemented):** PPT/EPH/SOP presence in
+  *tile-part headers* and per-tile COD/COC overrides — would require parsing each
+  tile-part header (the walk currently navigates by `Psot` without parsing
+  tile-part-header marker segments).
 - **Not checkable from a single codestream:** Max compressed bit rate / sampling
   rate (A.49/A.50/A.53/A.54) need frame rate + per-frame compressed size (frame
   rate from CPL edit rate, size from the index table) — a cross-frame check, not

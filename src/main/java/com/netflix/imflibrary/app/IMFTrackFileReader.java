@@ -405,6 +405,47 @@ public final class IMFTrackFileReader
      */
     public byte[] getEssenceElementHeaderBytes(int editUnitIndex, int maxBytes, @Nonnull IMFErrorLogger imfErrorLogger) throws IOException
     {
+        long[] valueRange = locateEssenceElementValue(editUnitIndex, imfErrorLogger);
+        if (valueRange == null)
+        {
+            return null;
+        }
+        long valueStart = valueRange[0];
+        long bytesToRead = Math.min((long) maxBytes, valueRange[1]);
+        if (bytesToRead <= 0)
+        {
+            return null;
+        }
+        return this.resourceByteRangeProvider.getByteRangeAsBytes(valueStart, valueStart + bytesToRead - 1);
+    }
+
+    /**
+     * Reads the complete essence element (e.g. an entire JPEG 2000 codestream) at the given edit unit (frame) index.
+     * Unlike {@link #getEssenceElementHeaderBytes}, this returns the whole element value, which is required for checks
+     * that must walk the tile-part structure (e.g. TLM conformance).
+     *
+     * @param editUnitIndex zero-based edit unit (frame) index
+     * @param imfErrorLogger an error logger
+     * @return the complete essence element value bytes, or null if the frame cannot be located
+     * @throws IOException any I/O related error is exposed through an IOException
+     */
+    public byte[] getEssenceElementBytes(int editUnitIndex, @Nonnull IMFErrorLogger imfErrorLogger) throws IOException
+    {
+        long[] valueRange = locateEssenceElementValue(editUnitIndex, imfErrorLogger);
+        if (valueRange == null || valueRange[1] <= 0)
+        {
+            return null;
+        }
+        return this.resourceByteRangeProvider.getByteRangeAsBytes(valueRange[0], valueRange[0] + valueRange[1] - 1);
+    }
+
+    /**
+     * Resolves the file location of the essence element value for the given edit unit.
+     *
+     * @return a two-element array {valueStartFileOffset, valueSize}, or null if the frame cannot be located
+     */
+    private long[] locateEssenceElementValue(int editUnitIndex, @Nonnull IMFErrorLogger imfErrorLogger) throws IOException
+    {
         EditUnitLocation location = getEditUnitLocation(editUnitIndex, imfErrorLogger);
         if (location == null)
         {
@@ -462,12 +503,7 @@ public final class IMFTrackFileReader
 
         KLVPacket.Header essenceElementHeader = readKLVHeader(targetFileOffset);
         long valueStart = targetFileOffset + essenceElementHeader.getKLSize();
-        long bytesToRead = Math.min((long) maxBytes, essenceElementHeader.getVSize());
-        if (bytesToRead <= 0)
-        {
-            return null;
-        }
-        return this.resourceByteRangeProvider.getByteRangeAsBytes(valueStart, valueStart + bytesToRead - 1);
+        return new long[]{valueStart, essenceElementHeader.getVSize()};
     }
 
     /** The essence-stream offset of an edit unit together with the BodySID of the container that holds it. */

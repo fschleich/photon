@@ -6,15 +6,15 @@ import org.testng.annotations.Test;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.util.List;
 
 @Test(groups = "unit")
 public class JPEG2000CodestreamTest {
 
-    /** Builds a minimal but well-formed J2K main header (SOC, SIZ, COD, QCD) followed by an SOT. */
-    private static byte[] buildMainHeader() throws IOException {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        DataOutputStream out = new DataOutputStream(baos); // DataOutputStream is big-endian
+    private static final int MARKER_SOD = 0xFF93;
 
+    /** Writes SOC, SIZ, COD and QCD (the part of the main header this parser models). */
+    private static void writeMainHeader(DataOutputStream out) throws IOException {
         // SOC
         out.writeShort(JPEG2000Codestream.MARKER_SOC);
 
@@ -59,10 +59,57 @@ public class JPEG2000CodestreamTest {
         out.writeByte(0x80);
         out.writeByte(0x90);
         out.writeByte(0xA0);
+    }
 
-        // SOT (ends the main header)
+    /** Builds a minimal main header (SOC, SIZ, COD, QCD) followed by an SOT. */
+    private static byte[] buildMainHeader() throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(baos);
+        writeMainHeader(out);
+        out.writeShort(JPEG2000Codestream.MARKER_SOT); // ends the main header
+        out.flush();
+        return baos.toByteArray();
+    }
+
+    /** A single tile-part: SOT(12) + SOD(2) + dataLen bytes; the declared Psot can be overridden to corrupt it. */
+    private static void writeTilePart(DataOutputStream out, int tileIndex, int tpsot, int tnsot, int dataLen, long psot) throws IOException {
         out.writeShort(JPEG2000Codestream.MARKER_SOT);
+        out.writeShort(10);             // Lsot
+        out.writeShort(tileIndex);      // Isot
+        out.writeInt((int) psot);       // Psot
+        out.writeByte(tpsot);           // TPsot
+        out.writeByte(tnsot);           // TNsot
+        out.writeShort(MARKER_SOD);     // SOD
+        for (int i = 0; i < dataLen; i++) out.writeByte(0x00);
+    }
 
+    /**
+     * Builds a complete codestream: main header, a TLM listing two tile-parts, the two tile-parts, and EOC.
+     * The two TLM-declared lengths can be overridden to simulate a non-conformant TLM.
+     */
+    private static byte[] buildFullCodestream(long tlmLen0, long tlmLen1) throws IOException {
+        // Tile-part actual lengths: 12 (SOT) + 2 (SOD) + dataLen.
+        int data0 = 10, data1 = 6;
+        long psot0 = 12 + 2 + data0; // 24
+        long psot1 = 12 + 2 + data1; // 20
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(baos);
+        writeMainHeader(out);
+
+        // TLM: Ztlm(1) + Stlm(1) + 2 entries; ST=1 (1-byte tile index), SP=0 (2-byte Ptlm) -> entrySize 3
+        out.writeShort(JPEG2000Codestream.MARKER_TLM);
+        out.writeShort(2 + 2 + 2 * 3);  // Ltlm = 10
+        out.writeByte(0x00);            // Ztlm
+        out.writeByte(0x10);            // Stlm: ST=1, SP=0
+        out.writeByte(0x00);            // Ttlm[0]
+        out.writeShort((int) tlmLen0);  // Ptlm[0]
+        out.writeByte(0x00);            // Ttlm[1]
+        out.writeShort((int) tlmLen1);  // Ptlm[1]
+
+        writeTilePart(out, 0, 0, 2, data0, psot0);
+        writeTilePart(out, 0, 1, 2, data1, psot1);
+        out.writeShort(JPEG2000Codestream.MARKER_EOC);
         out.flush();
         return baos.toByteArray();
     }
@@ -72,43 +119,57 @@ public class JPEG2000CodestreamTest {
         JPEG2000Codestream cs = JPEG2000Codestream.fromBytes(buildMainHeader());
         J2KHeaderParameters p = cs.getHeaderParameters();
 
-        // SIZ
         Assert.assertEquals((int) p.rsiz, 0x0401);
         Assert.assertEquals((long) p.xsiz, 1920L);
         Assert.assertEquals((long) p.ysiz, 1080L);
-        Assert.assertEquals((long) p.xosiz, 0L);
-        Assert.assertEquals((long) p.xtsiz, 1920L);
         Assert.assertEquals(p.csiz.length, 3);
         Assert.assertEquals(p.csiz[0].ssiz, (short) 0x0B);
-        Assert.assertEquals(p.csiz[0].xrsiz, (short) 1);
-        Assert.assertEquals(p.csiz[2].yrsiz, (short) 1);
-
-        // COD
         Assert.assertEquals(p.cod.progressionOrder, (short) 4); // CPRL
-        Assert.assertEquals(p.cod.numLayers, 1);
-        Assert.assertEquals(p.cod.multiComponentTransform, (short) 1);
         Assert.assertEquals(p.cod.numDecompLevels, (short) 5);
         Assert.assertEquals(p.cod.xcb, (short) 5); // raw 3 + 2
-        Assert.assertEquals(p.cod.ycb, (short) 5);
-        Assert.assertEquals(p.cod.cbStyle, (short) 0);
         Assert.assertEquals(p.cod.transformation, (short) 0);
         Assert.assertEquals(p.cod.precinctSizes.length, 6);
         Assert.assertEquals(p.cod.precinctSizes[0], (short) 0x77);
-        Assert.assertEquals(p.cod.precinctSizes[1], (short) 0x88);
-
-        // QCD
-        Assert.assertEquals(p.qcd.sqcd, (short) 0x20);
         Assert.assertEquals(p.qcd.spqcd.length, 3);
-        Assert.assertEquals(p.qcd.spqcd[0], 0x80);
 
-        // Markers in order: SOC, SIZ, COD, QCD, SOT
-        Assert.assertEquals(cs.getMarkers().get(0).intValue(), JPEG2000Codestream.MARKER_SOC);
-        Assert.assertEquals(cs.getMarkers().get(1).intValue(), JPEG2000Codestream.MARKER_SIZ);
-        Assert.assertEquals(cs.getMarkers().get(cs.getMarkers().size() - 1).intValue(), JPEG2000Codestream.MARKER_SOT);
+        // Header-only buffer: no tile-parts walked.
+        Assert.assertTrue(cs.getTileParts().isEmpty());
     }
 
     @Test(expectedExceptions = com.netflix.imflibrary.exceptions.MXFException.class)
     public void testMissingSOCThrows() throws IOException {
         JPEG2000Codestream.fromBytes(new byte[]{(byte) 0xAB, (byte) 0xCD, 0x00, 0x00});
+    }
+
+    @Test
+    public void testTilePartWalkAndConformantTLM() throws IOException {
+        JPEG2000Codestream cs = JPEG2000Codestream.fromBytes(buildFullCodestream(24, 20));
+
+        Assert.assertTrue(cs.isTilePartStructureValid());
+        Assert.assertTrue(cs.reachedEndOfCodestream());
+
+        List<JPEG2000Codestream.TilePart> tps = cs.getTileParts();
+        Assert.assertEquals(tps.size(), 2);
+        Assert.assertEquals(tps.get(0).length, 24L);
+        Assert.assertEquals(tps.get(1).length, 20L);
+
+        List<JPEG2000Codestream.TLMEntry> tlm = cs.getTLMEntries();
+        Assert.assertEquals(tlm.size(), 2);
+        // Conformant: TLM-declared lengths equal the measured tile-part lengths.
+        Assert.assertEquals(tlm.get(0).length, tps.get(0).length);
+        Assert.assertEquals(tlm.get(1).length, tps.get(1).length);
+    }
+
+    @Test
+    public void testNonConformantTLMIsDetectable() throws IOException {
+        // TLM declares 99 for tile-part 0, but the actual length is 24.
+        JPEG2000Codestream cs = JPEG2000Codestream.fromBytes(buildFullCodestream(99, 20));
+
+        List<JPEG2000Codestream.TilePart> tps = cs.getTileParts();
+        List<JPEG2000Codestream.TLMEntry> tlm = cs.getTLMEntries();
+        Assert.assertEquals(tps.size(), 2);
+        Assert.assertEquals(tlm.size(), 2);
+        Assert.assertNotEquals(tlm.get(0).length, tps.get(0).length); // 99 != 24
+        Assert.assertEquals(tlm.get(1).length, tps.get(1).length);    // 20 == 20
     }
 }

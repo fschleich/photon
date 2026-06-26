@@ -405,19 +405,23 @@ public final class IMFTrackFileReader
      */
     public byte[] getEssenceElementHeaderBytes(int editUnitIndex, int maxBytes, @Nonnull IMFErrorLogger imfErrorLogger) throws IOException
     {
-        long targetStreamOffset = getEditUnitStreamOffset(editUnitIndex, imfErrorLogger);
-        if (targetStreamOffset < 0)
+        EditUnitLocation location = getEditUnitLocation(editUnitIndex, imfErrorLogger);
+        if (location == null)
         {
             return null;
         }
+        long targetStreamOffset = location.streamOffset;
 
-        // Collect the body partitions that carry essence, ordered by their position within the essence stream.
+        // Collect the body partitions that carry the indexed essence container (matching BodySID), ordered by their
+        // position within the essence stream. Filtering by BodySID is essential for files that multiplex multiple
+        // essence containers (e.g. a picture track interleaved with a data/XML track).
         List<Long> partitionOffsets = getRandomIndexPack(imfErrorLogger).getAllPartitionByteOffsets();
         List<PartitionPack> essencePartitions = new ArrayList<>();
         for (long partitionOffset : partitionOffsets)
         {
             PartitionPack partitionPack = getPartitionPack(partitionOffset);
-            if (partitionPack.hasEssenceContainer())
+            if (partitionPack.hasEssenceContainer()
+                    && (location.bodySID <= 0 || partitionPack.getBodySID() == location.bodySID))
             {
                 essencePartitions.add(partitionPack);
             }
@@ -466,13 +470,27 @@ public final class IMFTrackFileReader
         return this.resourceByteRangeProvider.getByteRangeAsBytes(valueStart, valueStart + bytesToRead - 1);
     }
 
+    /** The essence-stream offset of an edit unit together with the BodySID of the container that holds it. */
+    private static final class EditUnitLocation
+    {
+        final long streamOffset;
+        final long bodySID;
+
+        EditUnitLocation(long streamOffset, long bodySID)
+        {
+            this.streamOffset = streamOffset;
+            this.bodySID = bodySID;
+        }
+    }
+
     /**
-     * Resolves the offset, relative to the start of the essence stream, of the essence element for the given edit unit.
-     * Handles both constant-bytes-per-element (CBE) and variable-bytes-per-element (VBE) index tables.
+     * Resolves the essence-stream offset of the essence element for the given edit unit, and the BodySID of the
+     * essence container that the resolving index table describes. Handles both constant-bytes-per-element (CBE) and
+     * variable-bytes-per-element (VBE) index tables.
      *
-     * @return the essence stream offset, or -1 if the edit unit cannot be resolved
+     * @return the edit unit location, or null if the edit unit cannot be resolved
      */
-    private long getEditUnitStreamOffset(int editUnitIndex, @Nonnull IMFErrorLogger imfErrorLogger) throws IOException
+    private EditUnitLocation getEditUnitLocation(int editUnitIndex, @Nonnull IMFErrorLogger imfErrorLogger) throws IOException
     {
         List<IndexTableSegment> segments = getIndexTableSegments(imfErrorLogger);
 
@@ -481,7 +499,7 @@ public final class IMFTrackFileReader
         {
             if (segment.getEditUnitByteCount() > 0)
             {
-                return (long) editUnitIndex * segment.getEditUnitByteCount();
+                return new EditUnitLocation((long) editUnitIndex * segment.getEditUnitByteCount(), segment.getBodySID());
             }
         }
 
@@ -498,10 +516,10 @@ public final class IMFTrackFileReader
             long start = segment.getIndexStartPosition();
             if (editUnitIndex >= start && editUnitIndex < start + entries.size())
             {
-                return entries.get((int) (editUnitIndex - start)).getStreamOffset();
+                return new EditUnitLocation(entries.get((int) (editUnitIndex - start)).getStreamOffset(), segment.getBodySID());
             }
         }
-        return -1;
+        return null;
     }
 
     /**

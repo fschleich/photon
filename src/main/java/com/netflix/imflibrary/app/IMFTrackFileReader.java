@@ -33,9 +33,13 @@ import com.netflix.imflibrary.st0377.StructuralMetadataID;
 import com.netflix.imflibrary.st0377.header.EssenceContainerData;
 import com.netflix.imflibrary.st0377.header.FileDescriptor;
 import com.netflix.imflibrary.st0377.header.GenericPackage;
+import com.netflix.imflibrary.st0377.header.GenericPictureEssenceDescriptor;
 import com.netflix.imflibrary.st0377.header.InterchangeObject;
+import com.netflix.imflibrary.st0377.header.JPEG2000PictureSubDescriptor;
 import com.netflix.imflibrary.st0377.header.Preface;
 import com.netflix.imflibrary.st0377.header.SourcePackage;
+import com.netflix.imflibrary.st0377.header.UL;
+import com.netflix.imflibrary.J2KHeaderParameters;
 import com.netflix.imflibrary.st2067_201.IABTrackFileConstraints;
 import com.netflix.imflibrary.st2067_203.MGASADMTrackFileConstraints;
 import com.netflix.imflibrary.utils.ByteArrayDataProvider;
@@ -63,6 +67,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -388,6 +393,156 @@ public final class IMFTrackFileReader
     }
 
     /**
+     * Reads the leading bytes of the essence element (e.g. a JPEG 2000 codestream) at the given edit unit (frame)
+     * index. Only up to {@code maxBytes} value bytes are returned, which is sufficient to recover a codestream main
+     * header for profile validation without reading the entire frame.
+     *
+     * @param editUnitIndex zero-based edit unit (frame) index
+     * @param maxBytes maximum number of value bytes to return from the essence element
+     * @param imfErrorLogger an error logger
+     * @return the leading essence element value bytes, or null if the frame cannot be located
+     * @throws IOException any I/O related error is exposed through an IOException
+     */
+    public byte[] getEssenceElementHeaderBytes(int editUnitIndex, int maxBytes, @Nonnull IMFErrorLogger imfErrorLogger) throws IOException
+    {
+        long targetStreamOffset = getEditUnitStreamOffset(editUnitIndex, imfErrorLogger);
+        if (targetStreamOffset < 0)
+        {
+            return null;
+        }
+
+        // Collect the body partitions that carry essence, ordered by their position within the essence stream.
+        List<Long> partitionOffsets = getRandomIndexPack(imfErrorLogger).getAllPartitionByteOffsets();
+        List<PartitionPack> essencePartitions = new ArrayList<>();
+        for (long partitionOffset : partitionOffsets)
+        {
+            PartitionPack partitionPack = getPartitionPack(partitionOffset);
+            if (partitionPack.hasEssenceContainer())
+            {
+                essencePartitions.add(partitionPack);
+            }
+        }
+        if (essencePartitions.isEmpty())
+        {
+            return null;
+        }
+        essencePartitions.sort(Comparator.comparingLong(PartitionPack::getEssenceStreamSegmentStartStreamPosition));
+
+        // The target edit unit lives in the last partition whose essence stream start is at or before the target offset.
+        PartitionPack targetPartition = null;
+        for (PartitionPack partitionPack : essencePartitions)
+        {
+            if (partitionPack.getEssenceStreamSegmentStartStreamPosition() <= targetStreamOffset)
+            {
+                targetPartition = partitionPack;
+            }
+            else
+            {
+                break;
+            }
+        }
+        if (targetPartition == null)
+        {
+            return null;
+        }
+
+        long firstEssenceFileOffset = findFirstEssenceElementFileOffset(targetPartition);
+        if (firstEssenceFileOffset < 0)
+        {
+            return null;
+        }
+
+        // The first essence element in the partition corresponds to the partition's essence stream start position.
+        long targetFileOffset = firstEssenceFileOffset
+                + (targetStreamOffset - targetPartition.getEssenceStreamSegmentStartStreamPosition());
+
+        KLVPacket.Header essenceElementHeader = readKLVHeader(targetFileOffset);
+        long valueStart = targetFileOffset + essenceElementHeader.getKLSize();
+        long bytesToRead = Math.min((long) maxBytes, essenceElementHeader.getVSize());
+        if (bytesToRead <= 0)
+        {
+            return null;
+        }
+        return this.resourceByteRangeProvider.getByteRangeAsBytes(valueStart, valueStart + bytesToRead - 1);
+    }
+
+    /**
+     * Resolves the offset, relative to the start of the essence stream, of the essence element for the given edit unit.
+     * Handles both constant-bytes-per-element (CBE) and variable-bytes-per-element (VBE) index tables.
+     *
+     * @return the essence stream offset, or -1 if the edit unit cannot be resolved
+     */
+    private long getEditUnitStreamOffset(int editUnitIndex, @Nonnull IMFErrorLogger imfErrorLogger) throws IOException
+    {
+        List<IndexTableSegment> segments = getIndexTableSegments(imfErrorLogger);
+
+        // CBE: a uniform edit unit byte count applies across the whole essence stream.
+        for (IndexTableSegment segment : segments)
+        {
+            if (segment.getEditUnitByteCount() > 0)
+            {
+                return (long) editUnitIndex * segment.getEditUnitByteCount();
+            }
+        }
+
+        // VBE: flatten per-edit-unit stream offsets across segments ordered by index start position.
+        List<IndexTableSegment> sorted = new ArrayList<>(segments);
+        sorted.sort(Comparator.comparingLong(IndexTableSegment::getIndexStartPosition));
+        for (IndexTableSegment segment : sorted)
+        {
+            List<IndexTableSegment.IndexEntryArray.IndexEntry> entries = segment.getIndexEntries();
+            if (entries == null || entries.isEmpty())
+            {
+                continue;
+            }
+            long start = segment.getIndexStartPosition();
+            if (editUnitIndex >= start && editUnitIndex < start + entries.size())
+            {
+                return entries.get((int) (editUnitIndex - start)).getStreamOffset();
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Walks the KLV packets of a body partition, skipping fill items and index table segments, and returns the file
+     * offset of the first essence element.
+     *
+     * @return the file offset of the first essence element, or -1 if none is found
+     */
+    private long findFirstEssenceElementFileOffset(PartitionPack partitionPack) throws IOException
+    {
+        long offset = partitionPack.getPartitionDataByteOffset();
+        long fileSize = this.resourceByteRangeProvider.getResourceSize();
+        int guard = 0;
+        while (offset < fileSize && guard++ < 1024)
+        {
+            KLVPacket.Header header = readKLVHeader(offset);
+            byte[] key = header.getKey();
+            if (KLVPacket.isKLVFillItem(key) || IndexTableSegment.isValidKey(key))
+            {
+                offset += header.getKLSize() + header.getVSize();
+                continue;
+            }
+            return offset;
+        }
+        return -1;
+    }
+
+    /**
+     * Reads and parses the KLV packet header located at the given file offset.
+     */
+    private KLVPacket.Header readKLVHeader(long offset) throws IOException
+    {
+        long fileSize = this.resourceByteRangeProvider.getResourceSize();
+        long rangeEnd = offset + (KLVPacket.KEY_FIELD_SIZE + KLVPacket.LENGTH_FIELD_SUFFIX_MAX_SIZE) - 1;
+        rangeEnd = rangeEnd < (fileSize - 1) ? rangeEnd : (fileSize - 1);
+        Path pathWithKLVHeader = this.resourceByteRangeProvider.getByteRange(offset, rangeEnd, this.workingDirectory);
+        ByteProvider byteProvider = this.getByteProvider(pathWithKLVHeader);
+        return new KLVPacket.Header(byteProvider, offset);
+    }
+
+    /**
      * Returns a model instance corresponding to the RandomIndexPack section of the MXF file
      * @return a {@link com.netflix.imflibrary.st0377.RandomIndexPack} representation of the random index pack section
      * @throws IOException - any I/O related error is exposed through an IOException
@@ -623,6 +778,47 @@ public final class IMFTrackFileReader
      */
     public BigInteger getEssenceDuration(@Nonnull IMFErrorLogger imfErrorLogger) throws IOException {
         return this.getHeaderPartition(imfErrorLogger).getEssenceDuration();
+    }
+
+    /**
+     * Returns the PictureEssenceCoding UL declared by the picture essence descriptor, which identifies the JPEG 2000
+     * profile of the essence. Returns null if no picture essence descriptor is present.
+     *
+     * @param imfErrorLogger an error logger for recording any errors - cannot be null
+     * @return the PictureEssenceCoding UL, or null
+     * @throws IOException any I/O related error is exposed through an IOException
+     */
+    public UL getPictureEssenceCodingUL(@Nonnull IMFErrorLogger imfErrorLogger) throws IOException {
+        HeaderPartition headerPartition = this.getHeaderPartition(imfErrorLogger);
+        for (InterchangeObject.InterchangeObjectBO descriptor : headerPartition.getEssenceDescriptors()) {
+            if (descriptor instanceof GenericPictureEssenceDescriptor.GenericPictureEssenceDescriptorBO) {
+                return ((GenericPictureEssenceDescriptor.GenericPictureEssenceDescriptorBO) descriptor).getPictureEssenceCodingUL();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns the {@link J2KHeaderParameters} declared by the JPEG 2000 picture sub-descriptor, or null if the essence
+     * does not carry one.
+     *
+     * @param imfErrorLogger an error logger for recording any errors - cannot be null
+     * @return the descriptor-declared J2K header parameters, or null
+     * @throws IOException any I/O related error is exposed through an IOException
+     */
+    public J2KHeaderParameters getDescriptorJ2KHeaderParameters(@Nonnull IMFErrorLogger imfErrorLogger) throws IOException {
+        HeaderPartition headerPartition = this.getHeaderPartition(imfErrorLogger);
+        for (InterchangeObject.InterchangeObjectBO descriptor : headerPartition.getEssenceDescriptors()) {
+            if (descriptor instanceof GenericPictureEssenceDescriptor.GenericPictureEssenceDescriptorBO) {
+                for (InterchangeObject.InterchangeObjectBO subDescriptor : headerPartition.getSubDescriptors(descriptor)) {
+                    if (subDescriptor instanceof JPEG2000PictureSubDescriptor.JPEG2000PictureSubDescriptorBO) {
+                        return J2KHeaderParameters.fromJPEG2000PictureSubDescriptorBO(
+                                (JPEG2000PictureSubDescriptor.JPEG2000PictureSubDescriptorBO) subDescriptor);
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     /**

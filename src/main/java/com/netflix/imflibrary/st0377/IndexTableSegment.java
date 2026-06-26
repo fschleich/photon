@@ -204,6 +204,47 @@ public final class IndexTableSegment
     }
 
     /**
+     * Getter for the edit unit byte count. A non-zero value indicates a constant-bytes-per-element (CBE) essence;
+     * zero (or absent) indicates variable-bytes-per-element (VBE) essence described by the index entry array.
+     *
+     * @return the edit unit byte count, or 0 when not present
+     */
+    public long getEditUnitByteCount()
+    {
+        return this.edit_unit_byte_count != null ? this.edit_unit_byte_count : 0L;
+    }
+
+    /**
+     * Getter for the index start position (the edit unit index of the first entry described by this segment).
+     *
+     * @return the index start position, or 0 when not present
+     */
+    public long getIndexStartPosition()
+    {
+        return this.index_start_position != null ? this.index_start_position : 0L;
+    }
+
+    /**
+     * Getter for the index duration (the number of edit units described by this segment).
+     *
+     * @return the index duration, or 0 when not present
+     */
+    public long getIndexDuration()
+    {
+        return this.index_duration != null ? this.index_duration : 0L;
+    }
+
+    /**
+     * Getter for the body SID identifying the essence container this index segment describes.
+     *
+     * @return the body SID, or 0 when not present
+     */
+    public long getBodySID()
+    {
+        return this.body_SID != null ? this.body_SID : 0L;
+    }
+
+    /**
      * Checks if the key passed in corresponds to a IndexTable segment
      *
      * @param key the key

@@ -103,6 +103,43 @@ java -cp "./build/libs/*:" com.netflix.imflibrary.app.IMPAnalyzer s3://imf-plugf
 ```
 
 
+### JPEG 2000 Codestream Validation
+
+By default, `IMPAnalyzer` validates JPEG 2000 essence using the metadata declared in the MXF/CPL JPEG 2000
+sub-descriptor only. The optional `--j2k-codestream` flag additionally parses the actual JPEG 2000 codestream
+main header of sampled frames and validates it against the profile identified by the picture essence coding UL
+(IMF 2K/4K/8K, Broadcast Contribution, and High-Throughput / BCP per SMPTE ST 2067-21 and ISO/IEC 15444-1). It
+also cross-checks the codestream against the sub-descriptor and verifies required markers are present.
+
+Sampling scope is controlled by the flag value:
+
+| Value | Frames validated |
+|----------|------------------|
+| `none` (default) | none — codestream validation is disabled |
+| `first` | the first frame only |
+| `every:N` | every Nth frame (frames 0, N, 2N, ...) |
+| `all` | every frame |
+
+Findings are reported as non-fatal validation messages (prefixed `J2K-CS`). The flag works for both IMF
+deliveries/IMPs and individual MXF track files.
+
+Examples (Linux/macOS):
+```
+// Validate the first frame's codestream of every track file in an IMP
+java -cp "./build/libs/*:" com.netflix.imflibrary.app.IMPAnalyzer local_folder_path --j2k-codestream=first
+
+// Sample every 24th frame of a single MXF track file
+java -cp "./build/libs/*:" com.netflix.imflibrary.app.IMPAnalyzer local_file.mxf --j2k-codestream=every:24
+
+// Validate every frame (slowest, most thorough)
+java -cp "./build/libs/*:" com.netflix.imflibrary.app.IMPAnalyzer local_folder_path --j2k-codestream=all
+```
+
+Example (Windows):
+```
+java -cp build\libs\*; com.netflix.imflibrary.app.IMPAnalyzer IMP_folder_path --j2k-codestream=first
+```
+
 ### API and Developer Documentation
 
 API documentation is available via [Javadoc](http://netflix.github.io/photon/).

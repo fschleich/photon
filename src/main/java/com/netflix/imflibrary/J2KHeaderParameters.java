@@ -126,6 +126,15 @@ public class J2KHeaderParameters {
 
     public J2KHeaderParameters() {}
 
+    // From a JPEG 2000 codestream main header to common J2KHeaderParameters
+    public static J2KHeaderParameters fromCodestream(byte[] codestream) {
+        try {
+            return JPEG2000Codestream.fromBytes(codestream).getHeaderParameters();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
     // From CPL Descriptor to common J2KHeaderParameters
     public static J2KHeaderParameters fromDOMNode(DOMNodeObjectModel imageEssencedescriptorDOMNode) {
         J2KHeaderParameters p = new J2KHeaderParameters();

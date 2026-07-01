@@ -126,6 +126,15 @@ public class J2KHeaderParameters {
 
     public J2KHeaderParameters() {}
 
+    // From a JPEG 2000 codestream main header to common J2KHeaderParameters
+    public static J2KHeaderParameters fromCodestream(byte[] codestream) {
+        try {
+            return JPEG2000Codestream.fromBytes(codestream).getHeaderParameters();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
     // From CPL Descriptor to common J2KHeaderParameters
     public static J2KHeaderParameters fromDOMNode(DOMNodeObjectModel imageEssencedescriptorDOMNode) {
         J2KHeaderParameters p = new J2KHeaderParameters();
@@ -285,19 +294,21 @@ public class J2KHeaderParameters {
             return null;
         }
 
-        // CAP
+        // CAP (optional: absent for non-HT IMF/Broadcast profiles, which carry no CAP marker)
         J2KExtendedCapabilities j2KExtendedCapabilities = jpeg2000PictureSubDescriptorBO.getJ2kExtendedCapabilities();
-        List<Short> subDescriptorcCap = j2KExtendedCapabilities.getcCap().getEntries();
-        p.cap = new CAP();
-        p.cap.pcap = j2KExtendedCapabilities.getpCap();
-        p.cap.ccap = new int[subDescriptorcCap.size()];
-        for (int i = 0; i < p.cap.ccap.length; i++) {
-            p.cap.ccap[i] = subDescriptorcCap.get(i);
-        }
+        if (j2KExtendedCapabilities != null && j2KExtendedCapabilities.getcCap() != null) {
+            List<Short> subDescriptorcCap = j2KExtendedCapabilities.getcCap().getEntries();
+            p.cap = new CAP();
+            p.cap.pcap = j2KExtendedCapabilities.getpCap();
+            p.cap.ccap = new int[subDescriptorcCap.size()];
+            for (int i = 0; i < p.cap.ccap.length; i++) {
+                p.cap.ccap[i] = subDescriptorcCap.get(i);
+            }
 
-        int cCapLength = Long.bitCount(p.cap.pcap);
-        if (cCapLength > 0 && p.cap.ccap.length != cCapLength) {
-            return null;
+            int cCapLength = Long.bitCount(p.cap.pcap);
+            if (cCapLength > 0 && p.cap.ccap.length != cCapLength) {
+                return null;
+            }
         }
 
         // COD

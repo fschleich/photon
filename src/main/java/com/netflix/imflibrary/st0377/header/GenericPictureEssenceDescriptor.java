@@ -131,6 +131,14 @@ public abstract class GenericPictureEssenceDescriptor extends FileDescriptor {
         }
 
         /**
+         * Accessor for the PictureEssenceCoding UL
+         * @return a UL representing the PictureEssenceCoding (identifies the JPEG 2000 profile), or null if absent
+         */
+        public UL getPictureEssenceCodingUL(){
+            return this.picture_essence_coding;
+        }
+
+        /**
          * Accessor for the ColorPrimaries UL
          * @return a UL representing the ColorPrimaries
          */

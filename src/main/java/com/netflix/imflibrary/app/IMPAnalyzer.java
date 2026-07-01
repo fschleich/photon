@@ -4,6 +4,8 @@ import com.netflix.imflibrary.IMFErrorLogger;
 import com.netflix.imflibrary.IMFErrorLoggerImpl;
 import com.netflix.imflibrary.RESTfulInterfaces.IMPValidator;
 import com.netflix.imflibrary.RESTfulInterfaces.PayloadRecord;
+import com.netflix.imflibrary.validation.EssenceSamplingPolicy;
+import com.netflix.imflibrary.validation.J2KCodestreamValidator;
 import com.netflix.imflibrary.exceptions.IMFException;
 import com.netflix.imflibrary.exceptions.MXFException;
 import com.netflix.imflibrary.st0429_8.PackingList;
@@ -38,11 +40,13 @@ public class IMPAnalyzer {
 
     private static final class TrackFilePartitionsRecord {
         String filename;
+        Path path;
         PayloadRecord headerPartition;
         List<PayloadRecord> indexPartitions;
 
-        TrackFilePartitionsRecord(String filename, PayloadRecord headerPartition, List<PayloadRecord> indexPartitions) {
+        TrackFilePartitionsRecord(String filename, Path path, PayloadRecord headerPartition, List<PayloadRecord> indexPartitions) {
             this.filename = filename;
+            this.path = path;
             this.headerPartition = headerPartition;
             this.indexPartitions = indexPartitions;
         }
@@ -51,6 +55,10 @@ public class IMPAnalyzer {
 
 
     public static Map<String, List<ErrorLogger.ErrorObject>> analyzeDelivery(Path rootPath) throws IOException {
+        return analyzeDelivery(rootPath, EssenceSamplingPolicy.none());
+    }
+
+    public static Map<String, List<ErrorLogger.ErrorObject>> analyzeDelivery(Path rootPath, EssenceSamplingPolicy j2kSamplingPolicy) throws IOException {
 
         Map<String, List<ErrorLogger.ErrorObject>> errorMap = new HashMap<>();
         IMFErrorLogger imfErrorLogger = new IMFErrorLoggerImpl();
@@ -174,7 +182,7 @@ public class IMPAnalyzer {
                                     }
 
                                     // add entry to track file map for further validation
-                                    trackFileMap.put(trackFileID, new TrackFilePartitionsRecord(filename, headerPartitionPayloadRecord, indexTablePartitionPayloadRecords));
+                                    trackFileMap.put(trackFileID, new TrackFilePartitionsRecord(filename, assetPath, headerPartitionPayloadRecord, indexTablePartitionPayloadRecords));
                                 } catch( MXFException e) {
                                     assetErrorLogger.addAllErrors(e.getErrors());
                                 }
@@ -243,6 +251,22 @@ public class IMPAnalyzer {
 
                             // avoid overwriting
                             aggregateErrors.addAll(IMPValidator.validateEssencePartitions(essencePartitions, sequenceNamespace));
+
+                            // Optional JPEG 2000 codestream-level validation (off by default).
+                            if (j2kSamplingPolicy.getMode() != EssenceSamplingPolicy.Mode.NONE && trackFileEntry.path != null) {
+                                IMFErrorLogger j2kErrorLogger = new IMFErrorLoggerImpl();
+                                try {
+                                    Path workingDirectory = Files.createTempDirectory("imp-analyzer-j2k");
+                                    IMFTrackFileReader trackFileReader = new IMFTrackFileReader(workingDirectory, new FileByteRangeProvider(trackFileEntry.path));
+                                    J2KCodestreamValidator.validate(trackFileReader, j2kSamplingPolicy, j2kErrorLogger);
+                                } catch (IOException | RuntimeException e) {
+                                    j2kErrorLogger.addError(IMFErrorLogger.IMFErrors.ErrorCodes.IMF_ESSENCE_COMPONENT_ERROR,
+                                            IMFErrorLogger.IMFErrors.ErrorLevels.NON_FATAL,
+                                            String.format("J2K-CS: codestream validation failed for %s: %s", trackFileEntry.filename, e.getMessage()));
+                                }
+                                aggregateErrors.addAll(j2kErrorLogger.getErrors());
+                            }
+
                             if (errorMap.get(trackFileEntry.filename) != null)
                                 aggregateErrors.addAll(errorMap.get(trackFileEntry.filename));
                             errorMap.put(trackFileEntry.filename, aggregateErrors);
@@ -374,6 +398,10 @@ public class IMPAnalyzer {
 
 
     public static List<ErrorLogger.ErrorObject> analyzeFile(Path input, String namespace) throws IOException {
+        return analyzeFile(input, namespace, EssenceSamplingPolicy.none());
+    }
+
+    public static List<ErrorLogger.ErrorObject> analyzeFile(Path input, String namespace, EssenceSamplingPolicy j2kSamplingPolicy) throws IOException {
         IMFErrorLogger errorLogger = new IMFErrorLoggerImpl();
 
         if (!Files.isRegularFile(input)) {
@@ -419,6 +447,19 @@ public class IMPAnalyzer {
                 // validate essence partitions
                 errorLogger.addAllErrors(IMPValidator.validateEssencePartitions(essencePartitions, namespace));
 
+                // Optional JPEG 2000 codestream-level validation (off by default).
+                if (j2kSamplingPolicy.getMode() != EssenceSamplingPolicy.Mode.NONE) {
+                    try {
+                        Path workingDirectory = Files.createTempDirectory("imp-analyzer-j2k");
+                        IMFTrackFileReader trackFileReader = new IMFTrackFileReader(workingDirectory, resourceByteRangeProvider);
+                        J2KCodestreamValidator.validate(trackFileReader, j2kSamplingPolicy, errorLogger);
+                    } catch (IOException | RuntimeException e) {
+                        errorLogger.addError(IMFErrorLogger.IMFErrors.ErrorCodes.IMF_ESSENCE_COMPONENT_ERROR,
+                                IMFErrorLogger.IMFErrors.ErrorLevels.NON_FATAL,
+                                String.format("J2K-CS: codestream validation failed for %s: %s", fileName, e.getMessage()));
+                    }
+                }
+
                 return errorLogger.getErrors();
             }
         }
@@ -461,6 +502,8 @@ public class IMPAnalyzer {
         sb.append(String.format("%s <asset_map_file>%n", IMPAnalyzer.class.getName()));
         sb.append(String.format("%s <pkl_file>%n", IMPAnalyzer.class.getName()));
         sb.append(String.format("%s <mxf_file>%n", IMPAnalyzer.class.getName()));
+        sb.append(String.format("%nOptions:%n"));
+        sb.append(String.format("  --j2k-codestream=<none|first|every:N|all>  JPEG 2000 codestream validation scope (default: none)%n"));
         return sb.toString();
     }
 
@@ -495,13 +538,32 @@ public class IMPAnalyzer {
 
     public static void main(String args[]) throws IOException
     {
-        if (args.length < 1 || args.length > 2)
+        // Separate options (--flag=value) from positional arguments.
+        List<String> positional = new ArrayList<>();
+        EssenceSamplingPolicy j2kSamplingPolicy = EssenceSamplingPolicy.none();
+        for (String arg : args) {
+            if (arg.startsWith("--j2k-codestream=")) {
+                try {
+                    j2kSamplingPolicy = EssenceSamplingPolicy.parse(arg.substring("--j2k-codestream=".length()));
+                } catch (IllegalArgumentException e) {
+                    logger.error(e.getMessage());
+                    System.exit(-1);
+                }
+            } else if (arg.startsWith("--")) {
+                logger.error(String.format("Unrecognised option: %s%n%s", arg, usage()));
+                System.exit(-1);
+            } else {
+                positional.add(arg);
+            }
+        }
+
+        if (positional.size() < 1 || positional.size() > 2)
         {
             logger.error(usage());
             System.exit(-1);
         }
 
-        String inputFileName = args[0];
+        String inputFileName = positional.get(0);
         Path input = Utilities.getPathFromString(inputFileName);
 
         if (Files.isDirectory(input)) {
@@ -509,7 +571,7 @@ public class IMPAnalyzer {
             logger.info(String.format("Analyzing IMF delivery: %s", inputFileName));
             logger.info("==========================================================================");
 
-            Map<String, List<ErrorLogger.ErrorObject>> errorMap = analyzeDelivery(input);
+            Map<String, List<ErrorLogger.ErrorObject>> errorMap = analyzeDelivery(input, j2kSamplingPolicy);
             for(Map.Entry<String, List<ErrorLogger.ErrorObject>> entry: errorMap.entrySet()) {
                 logErrors(entry.getKey(), entry.getValue());
             }
@@ -518,13 +580,13 @@ public class IMPAnalyzer {
         {
             Path filename = input.getFileName();
             String namespace = null;
-            if (args.length == 2)
-                namespace = args[1];
+            if (positional.size() == 2)
+                namespace = positional.get(1);
             if (filename != null) {
                 logger.info("==========================================================================\n" );
                 logger.info(String.format("Analyzing file: %s", filename.toString()));
                 logger.info("==========================================================================\n");
-                List<ErrorLogger.ErrorObject>errors = analyzeFile(input, namespace);
+                List<ErrorLogger.ErrorObject>errors = analyzeFile(input, namespace, j2kSamplingPolicy);
                 logErrors(filename.toString(), errors);
             }
         }

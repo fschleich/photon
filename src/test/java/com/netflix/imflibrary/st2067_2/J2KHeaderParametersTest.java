@@ -3,6 +3,7 @@ package com.netflix.imflibrary.st2067_2;
 import com.netflix.imflibrary.IMFErrorLogger;
 import com.netflix.imflibrary.IMFErrorLoggerImpl;
 import com.netflix.imflibrary.J2KHeaderParameters;
+import com.netflix.imflibrary.app.IMFTrackFileReader;
 import com.netflix.imflibrary.st0377.HeaderPartition;
 import com.netflix.imflibrary.st0377.header.GenericPictureEssenceDescriptor;
 import com.netflix.imflibrary.st0377.header.InterchangeObject;
@@ -45,6 +46,30 @@ public class J2KHeaderParametersTest {
 
         // ...and validate that they are the same.
         Assert.assertTrue(fromCPL.equals(fromMXF));
+    }
+
+    @Test
+    public void testParsedCodestreamMatchesDescriptor() throws IOException {
+        Path inputMXFFile = TestHelper.findResourceByPath("TestIMP/HT/IMP/VIDEO_6ed567b7-c030-46d6-9c1c-0f09bab4b962.mxf");
+        IMFErrorLogger imfErrorLogger = new IMFErrorLoggerImpl();
+
+        // Descriptor-derived J2K parameters.
+        HeaderPartition headerPartition = HeaderPartition.fromPath(inputMXFFile, imfErrorLogger);
+        GenericPictureEssenceDescriptor pictureEssenceDescriptor = ((GenericPictureEssenceDescriptor) ((SourcePackage) headerPartition.getSourcePackages().get(0)).getGenericDescriptor());
+        GenericPictureEssenceDescriptor.GenericPictureEssenceDescriptorBO descriptorBO = (GenericPictureEssenceDescriptor.GenericPictureEssenceDescriptorBO) TestHelper.getValue(pictureEssenceDescriptor, "rgbaPictureEssenceDescriptorBO");
+        JPEG2000PictureSubDescriptor.JPEG2000PictureSubDescriptorBO jpeg2000PictureSubDescriptorBO = (JPEG2000PictureSubDescriptor.JPEG2000PictureSubDescriptorBO) headerPartition.getSubDescriptors(descriptorBO).get(0);
+        J2KHeaderParameters fromDescriptor = J2KHeaderParameters.fromJPEG2000PictureSubDescriptorBO(jpeg2000PictureSubDescriptorBO);
+
+        // Codestream-derived J2K parameters: read the first frame's essence and parse its main header.
+        Path workingDirectory = java.nio.file.Files.createTempDirectory("j2k-codestream-test");
+        IMFTrackFileReader trackFileReader = new IMFTrackFileReader(workingDirectory, new FileByteRangeProvider(inputMXFFile));
+        byte[] codestreamHeader = trackFileReader.getEssenceElementHeaderBytes(0, 8192, imfErrorLogger);
+        Assert.assertNotNull(codestreamHeader, "Could not extract first frame essence bytes");
+        J2KHeaderParameters fromCodestream = J2KHeaderParameters.fromCodestream(codestreamHeader);
+        Assert.assertNotNull(fromCodestream, "Could not parse codestream main header");
+
+        // The codestream main header must match the MXF JPEG2000 sub-descriptor.
+        Assert.assertEquals(fromCodestream, fromDescriptor);
     }
 
 }
